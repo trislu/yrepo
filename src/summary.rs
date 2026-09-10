@@ -145,6 +145,13 @@ impl SummaryIndex {
         self.entries.len()
     }
 
+    /// Every indexed summary, in scan (insertion) order. Lets a caller build
+    /// an index-wide projection (e.g. the language server's `ModuleInfo`
+    /// summaries for instance-document classification and root completion).
+    pub fn summaries(&self) -> impl Iterator<Item = &ModuleSummary> {
+        self.entries.iter().map(|e| &e.summary)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -335,6 +342,39 @@ submodule demo-sub {
         assert!(index.resolve_namespace("urn:other").is_some());
         // A submodule has no namespace and is never namespace-resolvable.
         assert!(index.resolve_namespace("").is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn summaries_yields_every_indexed_entry_in_scan_order() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "yrepo-summary-iter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, src: &str| {
+            let p = dir.join(name);
+            fs::write(&p, src).unwrap();
+            p
+        };
+        let a = write(
+            "a.yang",
+            "module a { namespace \"urn:a\"; prefix a; leaf x { type string; } }",
+        );
+        let b = write(
+            "b.yang",
+            "module b { namespace \"urn:b\"; prefix b; container c { leaf y { type string; } } }",
+        );
+        let mut index = SummaryIndex::default();
+        index.scan_many_files_with([&a, &b], |p| Some(format!("file://{}", p.display())));
+        let names: Vec<&str> = index.summaries().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "scan order is preserved");
+        assert_eq!(index.summaries().count(), index.len());
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-11
+
+### Added
+
+- `SummaryIndex::summaries()` — iterator accessor over the indexed module
+  summaries, needed by consumers that serve schema suggestions from summaries
+  without a compiled library (netconf-language-server instance documents).
+  Additive; no other behaviour change.
+
 ## [0.7.0] - 2026-09-11
 
 ### Added
