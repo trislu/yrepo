@@ -194,6 +194,90 @@ impl CatalogIndex {
         names.sort();
         names
     }
+
+    /// Resolve `name`/`revision` by scanning **only** `candidates` into this
+    /// index first (lazy startup-catalog path): returns the winning url and
+    /// how many candidate files were parsed. Nothing is parsed when the name
+    /// is already resolvable; when the candidates yield no entry for `name`
+    /// the result is `None` (the caller decides on a fallback). Resolution
+    /// follows [`CatalogIndex::resolve`] exactly, so a lazily grown index and
+    /// a whole-tree index pick the same winner.
+    pub fn resolve_lazy<I, P, F>(
+        &mut self,
+        name: &str,
+        revision: Option<&str>,
+        candidates: I,
+        url_for: F,
+    ) -> (Option<String>, usize)
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+        F: Fn(&Path) -> Option<String> + Send + Sync,
+    {
+        if let Some(entry) = self.resolve(name, revision) {
+            return (Some(entry.url.to_string()), 0);
+        }
+        let parsed = self.scan_many_files_with(candidates, url_for);
+        let winner = self.resolve(name, revision).map(|e| e.url.to_string());
+        (winner, parsed)
+    }
+}
+
+/// A cheap path index built from a directory walk **without parsing**: maps
+/// each basename (minus the `@revision-date` suffix) to its candidate files,
+/// sorted for deterministic tie-breaks. This is what lets startup defer all
+/// header parsing: a needed name is resolved later by parsing only its
+/// candidates (see [`CatalogIndex::resolve_lazy`]).
+#[derive(Debug, Default)]
+pub struct PathIndex {
+    by_name: std::collections::HashMap<String, Vec<PathBuf>>,
+}
+
+impl PathIndex {
+    /// Build the index from file paths. Files whose basename is empty are
+    /// skipped; the filename suffix `@YYYY-MM-DD…` is dropped (YANG
+    /// identifiers cannot contain `@`, so the first `@` starts the suffix).
+    pub fn build<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut by_name: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+        for path in paths {
+            let path = path.as_ref();
+            if let Some(name) = module_name_key(path) {
+                by_name.entry(name).or_default().push(path.to_path_buf());
+            }
+        }
+        for candidates in by_name.values_mut() {
+            candidates.sort();
+        }
+        PathIndex { by_name }
+    }
+
+    /// Candidate files for a module/submodule name (sorted; empty when the
+    /// name has no filename match and a fallback is required).
+    pub fn candidates(&self, name: &str) -> &[PathBuf] {
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Number of distinct names in the index.
+    pub fn names_len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// Number of files in the index.
+    pub fn file_count(&self) -> usize {
+        self.by_name.values().map(Vec::len).sum()
+    }
+}
+
+/// Basename (minus extension and `@revision-date` suffix) of a path.
+fn module_name_key(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let base = stem.split('@').next().unwrap_or(stem);
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 /// Build a Repository that contains `roots` and the full reachable closure
@@ -510,5 +594,85 @@ mod tests {
         assert!(
             !Catalog::scan("/m/bad.yang", "module bad { namespace \"urn:bad\"; prefix").parse_ok
         );
+    }
+
+    #[test]
+    fn path_index_groups_basenames_and_strips_revision_suffix() {
+        let index = PathIndex::build([
+            "/w/m@2021-01-01.yang",
+            "/w/m@2019-01-01.yang",
+            "/w/other.yang",
+        ]);
+        assert_eq!(index.names_len(), 2);
+        assert_eq!(index.file_count(), 3);
+        let candidates = index.candidates("m");
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates[0].to_string_lossy().contains("2019"),
+            "candidates are sorted deterministically"
+        );
+        assert!(index.candidates("ghost").is_empty());
+    }
+
+    #[test]
+    fn resolve_lazy_scans_only_candidates_and_matches_full_resolve() {
+        use std::fs;
+        use std::path::PathBuf;
+        let dir = std::env::temp_dir().join(format!(
+            "yrepo-lazy-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |file: &str, src: &str| -> PathBuf {
+            let p = dir.join(file);
+            fs::write(&p, src).unwrap();
+            p
+        };
+        let old = write(
+            "m@2019-01-01.yang",
+            "module m { namespace \"urn:m\"; prefix m; revision 2019-01-01; }",
+        );
+        let new = write(
+            "m@2021-01-01.yang",
+            "module m { namespace \"urn:m\"; prefix m; revision 2021-01-01; }",
+        );
+        let other = write(
+            "other.yang",
+            "module other { namespace \"urn:o\"; prefix o; }",
+        );
+        let paths = PathIndex::build([old.clone(), new.clone(), other]);
+        let url_of = |p: &std::path::Path| Some(format!("file://{}", p.display()));
+
+        let mut index = CatalogIndex::default();
+        let (winner, parsed) = index.resolve_lazy("m", None, paths.candidates("m").iter(), url_of);
+        assert_eq!(parsed, 2, "both candidates parsed once");
+        assert!(winner.as_deref().unwrap().contains("2021"));
+
+        // Cached: a second lookup parses nothing.
+        let (again, parsed_again) =
+            index.resolve_lazy("m", None, paths.candidates("m").iter(), url_of);
+        assert_eq!(parsed_again, 0);
+        assert_eq!(again, winner);
+
+        // A pinned revision resolves without new parses too.
+        let (pinned, parsed_pin) = index.resolve_lazy(
+            "m",
+            Some("2019-01-01"),
+            paths.candidates("m").iter(),
+            url_of,
+        );
+        assert!(pinned.as_deref().unwrap().contains("2019"));
+        assert_eq!(parsed_pin, 0);
+
+        // No filename candidates: no parse, no winner (caller falls back).
+        let (missing, parsed_missing) =
+            index.resolve_lazy("ghost", None, paths.candidates("ghost").iter(), url_of);
+        assert!(missing.is_none());
+        assert_eq!(parsed_missing, 0);
+        fs::remove_dir_all(&dir).ok();
     }
 }
