@@ -160,6 +160,28 @@ one-shot tools only; the RESIDENT server keeps the sequential scan
 (`fill_catalog`) so its RSS stays ~255 MB instead of carrying a multi-GB
 parse high-water.
 
+## Post-fix catalog re-baseline (header-only scan, 2026-09-11)
+
+The catalog path no longer builds a full document: `Catalog::scan` parses in
+`ParseMode::HeaderOnly` (root + header statements only; no statement tree,
+tokens, comments or errors) and the full path's quoted-fragment recovery is
+now O(tokens + fragments) via a hash set. Measured with the new
+`examples/scanbench.rs` on the restored population (165 521 files / 3 319 MiB,
+release, `parallel`):
+
+| mode | wall | VmHWM | user / sys |
+| --- | --- | --- | --- |
+| seq | 98.0 s | 174 MB | 96.4 / 1.7 s |
+| par | 12.7 s | 914 MB | 198.4 / 3.5 s |
+| par-canon (LS-style urls) | 13.0 s | 919 MB | 197.9 / 7.0 s |
+
+Worst single file (5.96 MB Cisco NX module): `Catalog::scan` 4.97 s before →
+**0.19 s** after with the same harness; the scan is now parse-bound (raw
+grammar parse ≈0.14–0.16 s). The language server end-to-end (gnu + mimalloc,
+fixed yrepo) scans the same tree in **13.0 s at 3.6 % sys** (previously
+330–366 s at ~69 % sys on the static musl artifact). Earlier sequential
+numbers in this document (170 s / 218 s) are superseded by the table above.
+
 ## Interpretation
 
 1. Dropping the retained tree-sitter CST (no consumer; committed) cut ingest
