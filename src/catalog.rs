@@ -271,6 +271,28 @@ impl PathIndex {
     pub fn file_count(&self) -> usize {
         self.by_name.values().map(Vec::len).sum()
     }
+
+    /// Bounded fallback for names whose declared module name differs from the
+    /// filename: files under basename keys that start with `name` (typically
+    /// `name-suffix.yang` variants). Sorted, capped at `limit`, and empty for
+    /// an empty prefix so the caller stays bounded.
+    pub fn prefix_candidates(&self, name: &str, limit: usize) -> Vec<PathBuf> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<PathBuf> = Vec::new();
+        for (key, files) in &self.by_name {
+            if key.starts_with(name) {
+                out.extend(files.iter().cloned());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out.sort();
+        out.truncate(limit);
+        out
+    }
 }
 
 /// Basename (minus extension and `@revision-date` suffix) of a path.
@@ -612,6 +634,12 @@ mod tests {
             "candidates are sorted deterministically"
         );
         assert!(index.candidates("ghost").is_empty());
+        let prefixed =
+            PathIndex::build(["/w/base-spi.yang", "/w/base-routing.yang", "/w/other.yang"]);
+        let hits = prefixed.prefix_candidates("base", 10);
+        assert_eq!(hits.len(), 2);
+        assert!(prefixed.prefix_candidates("base", 1).len() == 1);
+        assert!(prefixed.prefix_candidates("", 10).is_empty());
     }
 
     #[test]
