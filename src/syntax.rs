@@ -467,6 +467,23 @@ pub struct ParsedDoc {
     /// including in [`ParseMode::HeaderOnly`] where `parse_errors` is not
     /// collected (it is exactly `parse_errors.is_empty()` elsewhere).
     pub parse_ok: bool,
+    /// Names extracted by a [`ParseMode::Summary`] parse (`None` in every
+    /// other mode): the root's direct top-level schema-body children.
+    pub(crate) summary: Option<SummaryScan>,
+}
+
+/// Names of a module/submodule root's direct top-level schema-body children,
+/// collected by a [`ParseMode::Summary`] parse without building any deeper
+/// statement. See [`crate::summary::ModuleSummary`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SummaryScan {
+    /// Top-level data node names (`container`/`leaf`/`leaf-list`/`list`/
+    /// `anyxml`/`anydata`), in source order.
+    pub(crate) top_data: Vec<String>,
+    /// Top-level `rpc` names, in source order.
+    pub(crate) rpcs: Vec<String>,
+    /// Top-level `notification` names, in source order.
+    pub(crate) notifications: Vec<String>,
 }
 
 /// A recovered syntax error.
@@ -494,6 +511,12 @@ pub(crate) enum ParseMode {
     /// belongs-to, imports with revision-date, includes, revision). No
     /// comments, tokens, or parse errors, and no fragment recovery.
     HeaderOnly,
+    /// Module summary: the [`ParseMode::HeaderOnly`] root, plus the names of
+    /// the root's direct top-level schema-body children — top-level data nodes
+    /// (`container`/`leaf`/`leaf-list`/`list`/`anyxml`/`anydata`) and
+    /// top-level `rpc`/`notification`. No comments, tokens, parse errors or
+    /// deeper statements, and no fragment recovery.
+    Summary,
 }
 
 pub(crate) fn parse(source: String) -> ParsedDoc {
@@ -527,13 +550,20 @@ pub(crate) fn parse_with(source: String, mode: ParseMode) -> ParsedDoc {
         .parse(&source, None)
         .expect("tree-sitter parse yields a tree");
 
-    if mode == ParseMode::HeaderOnly {
-        // Catalog scan: only the root + header statements survive; no
+    if mode == ParseMode::HeaderOnly || mode == ParseMode::Summary {
+        // Catalog/summary scan: only the root + header statements survive; no
         // comments, tokens or errors are collected. `has_error` is an O(1)
-        // subtree flag and equals "an ERROR/MISSING node exists".
+        // subtree flag and equals "an ERROR/MISSING node exists". Summary mode
+        // additionally records the root's direct top-level data/rpc/
+        // notification names from the transient CST.
         let root_node = tree.root_node();
         let parse_ok = !root_node.has_error();
-        let root = find_top_module(root_node).map(|n| build_header_statement(n, &text));
+        let top = find_top_module(root_node);
+        let summary = (mode == ParseMode::Summary).then(|| {
+            top.map(|n| scan_summary_names(n, &text))
+                .unwrap_or_default()
+        });
+        let root = top.map(|n| build_header_statement(n, &text));
         drop(tree);
         return ParsedDoc {
             text,
@@ -542,6 +572,7 @@ pub(crate) fn parse_with(source: String, mode: ParseMode) -> ParsedDoc {
             tokens: Vec::new(),
             parse_errors: Vec::new(),
             parse_ok,
+            summary,
         };
     }
 
@@ -573,6 +604,7 @@ pub(crate) fn parse_with(source: String, mode: ParseMode) -> ParsedDoc {
         tokens,
         parse_errors,
         parse_ok,
+        summary: None,
     }
 }
 
@@ -733,6 +765,35 @@ fn build_header_statement(node: Node, text: &Text) -> Statement {
         })
         .collect();
     statement_parts(node, &children, text, child_stmts)
+}
+
+/// Walk the *direct* CST statement children of a module/submodule root and
+/// record top-level data-node, `rpc` and `notification` names ([`ParseMode::Summary`]).
+///
+/// Only the root's immediate `*_stmt` children are inspected: nothing deeper is
+/// built, so a summary parse stays close to a header-only parse in cost.
+fn scan_summary_names(root: Node, text: &Text) -> SummaryScan {
+    let mut out = SummaryScan::default();
+    for child in children_of(root) {
+        let kind = child.kind();
+        if !kind.ends_with("_stmt") {
+            continue;
+        }
+        let bucket = match kind {
+            "container_stmt" | "leaf_stmt" | "leaf_list_stmt" | "list_stmt" | "anyxml_stmt"
+            | "anydata_stmt" => &mut out.top_data,
+            "rpc_stmt" => &mut out.rpcs,
+            "notification_stmt" => &mut out.notifications,
+            _ => continue,
+        };
+        if let Some(name) = find_arg(child, &children_of(child), text)
+            .map(|a| a.name().to_string())
+            .filter(|n| !n.is_empty())
+        {
+            bucket.push(name);
+        }
+    }
+    out
 }
 
 /// Recover how a statement terminates from its direct CST children.

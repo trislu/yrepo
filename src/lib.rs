@@ -32,6 +32,7 @@ mod grouping_topo;
 mod library;
 mod refidx;
 mod schema;
+mod summary;
 mod syntax;
 mod text;
 mod value;
@@ -48,6 +49,7 @@ pub use crate::schema::{
     IdentityRef, IdentityResolution, ImportInfo, ModuleRecord, NodeId, NodeKind, SchemaNode,
     SubmoduleRecord, TypeCandidate, TypeCandidateKind, TypeResolution, TypeStep, Typedef,
 };
+pub use crate::summary::{ModuleSummary, SummaryIndex};
 pub use crate::syntax::{
     Argument, Comment, CommentKind, Statement, StatementEnd, StatementKind, Token, TokenKind,
     TokenSpot,
