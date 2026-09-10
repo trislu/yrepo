@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-11
+
+### Added
+
+- **`yrepo::ModuleSummary` + `yrepo::SummaryIndex`** — a parse-level module
+  summary (name, namespace, revision, top-level data/rpc/notification names)
+  extracted with the new `ParseMode::Summary`, without building the full
+  statement tree, tokens or comments (`Full`/`Light`/`HeaderOnly` behaviour is
+  unchanged). `SummaryIndex::scan_many_files_with` scans a tree in parallel
+  with a caller-provided url mapping and `resolve_namespace` returns the
+  highest-revision parse-clean entry. This is the yrepo half of the
+  instance-document lazy schema design used by `netconf-language-server`
+  (root/data-root completion and namespace lookup for XML/RFC 7951 JSON
+  documents on very large workspaces).
+
 ## [0.6.0] - 2026-09-11
 
 ### Added
