@@ -44,18 +44,22 @@ pub struct CatalogImport {
 
 impl Catalog {
     /// Parse `source` and retain only the header facts. The parse is
-    /// transient: nothing but the returned fields is kept alive.
+    /// header-only (`ParseMode::HeaderOnly`): it builds just the
+    /// module/submodule root and the header statements `extract_header` reads
+    /// — no full statement tree, comments, tokens or parse errors — so the
+    /// scan cost stays close to the raw tree-sitter parse.
     pub fn scan(url: impl Into<Arc<str>>, source: impl Into<String>) -> Catalog {
         let url = url.into();
         let source = source.into();
-        let yang = crate::yang::Yang::new(url.clone(), source);
-        let parse_ok = yang.parse_errors.is_empty();
+        let parsed = crate::syntax::parse_with(source, crate::syntax::ParseMode::HeaderOnly);
+        let header = crate::yang::extract_header(parsed.root.as_ref());
+        let parse_ok = parsed.parse_ok;
         Catalog {
             url,
-            name: yang.name.clone().unwrap_or_default(),
-            revision: yang.revision.clone(),
-            prefix: yang.own_prefix.clone(),
-            imports: yang
+            name: header.name.unwrap_or_default(),
+            revision: header.revision,
+            prefix: header.own_prefix,
+            imports: header
                 .imports
                 .iter()
                 .map(|i| CatalogImport {
@@ -64,7 +68,7 @@ impl Catalog {
                     revision: i.revision.clone(),
                 })
                 .collect(),
-            includes: yang.includes.iter().map(|i| i.name.clone()).collect(),
+            includes: header.includes.iter().map(|i| i.name.clone()).collect(),
             parse_ok,
         }
     }
@@ -448,5 +452,63 @@ mod tests {
         );
         assert!(index.of_url(&files[1].to_string_lossy()).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The header-only scan must keep the exact shape `extract_header` reads:
+    /// every header field has to match the full (`Yang`) extraction.
+    #[test]
+    fn header_only_scan_matches_full_extraction() {
+        let sources: &[(&str, &str)] = &[
+            (
+                "/m/plain.yang",
+                "module plain { namespace \"urn:plain\"; prefix p; revision 2021-01-01; leaf a { type string; } }",
+            ),
+            (
+                "/m/imports.yang",
+                "module imports { namespace \"urn:i\"; prefix i;\n  import q { prefix q; revision-date 2019-01-01; }\n  import r { prefix r; }\n  include imported-sub;\n  revision 2022-05-05;\n}",
+            ),
+            (
+                "/m/sub.yang",
+                "submodule sub { belongs-to parent { prefix pa; }\n  import q { prefix q; }\n}",
+            ),
+            (
+                "/m/concat.yang",
+                "module concat { namespace \"urn:base/\" + \"urn:more\"; prefix c; }",
+            ),
+        ];
+        for (url, src) in sources {
+            let scanned = Catalog::scan(*url, *src);
+            let full = crate::yang::Yang::new(std::sync::Arc::from(*url), (*src).to_string());
+            assert_eq!(scanned.name, full.name.clone().unwrap_or_default(), "{url}");
+            assert_eq!(scanned.revision, full.revision, "{url}");
+            assert_eq!(scanned.prefix, full.own_prefix, "{url}");
+            assert_eq!(scanned.parse_ok, full.parse_errors.is_empty(), "{url}");
+            assert_eq!(scanned.imports.len(), full.imports.len(), "{url}");
+            for (s, f) in scanned.imports.iter().zip(&full.imports) {
+                assert_eq!(
+                    (s.module.as_str(), s.prefix.as_str()),
+                    (f.module.as_str(), f.prefix.as_str()),
+                    "{url}"
+                );
+                assert_eq!(s.revision, f.revision, "{url}");
+            }
+            let scanned_includes: Vec<&str> = scanned.includes.iter().map(String::as_str).collect();
+            let full_includes: Vec<&str> = full.includes.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(scanned_includes, full_includes, "{url}");
+        }
+    }
+
+    #[test]
+    fn header_only_scan_reports_parse_status() {
+        assert!(
+            Catalog::scan(
+                "/m/ok.yang",
+                "module ok { namespace \"urn:ok\"; prefix o; }"
+            )
+            .parse_ok
+        );
+        assert!(
+            !Catalog::scan("/m/bad.yang", "module bad { namespace \"urn:bad\"; prefix").parse_ok
+        );
     }
 }

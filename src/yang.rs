@@ -98,18 +98,21 @@ fn arg_name(stmt: &Statement) -> Option<String> {
     stmt.arg.as_ref().map(|a| a.name().to_string())
 }
 
-struct Header {
-    kind: Option<UnitKind>,
-    name: Option<String>,
-    namespace: Option<String>,
-    own_prefix: Option<String>,
-    belongs_to: Option<(String, String)>,
-    revision: Option<String>,
-    imports: Vec<Import>,
-    includes: Vec<Include>,
+pub(crate) struct Header {
+    pub(crate) kind: Option<UnitKind>,
+    pub(crate) name: Option<String>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) own_prefix: Option<String>,
+    pub(crate) belongs_to: Option<(String, String)>,
+    pub(crate) revision: Option<String>,
+    pub(crate) imports: Vec<Import>,
+    pub(crate) includes: Vec<Include>,
 }
 
-fn extract_header(root: Option<&Statement>) -> Header {
+/// Extract the module/submodule header facts from a statement root. Shared by
+/// the full `Yang` path and the header-only `Catalog::scan` path, so both see
+/// an identical `Statement` shape.
+pub(crate) fn extract_header(root: Option<&Statement>) -> Header {
     let root = match root {
         Some(r) => r,
         None => {

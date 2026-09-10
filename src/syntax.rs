@@ -7,6 +7,7 @@
 //!
 //! [D2]: see `docs/architecture.md` decision log.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -462,6 +463,10 @@ pub struct ParsedDoc {
     pub tokens: Vec<Token>,
     /// Syntax problems recovered by tree-sitter (never fatal).
     pub parse_errors: Vec<ParseError>,
+    /// True when the CST carried no `ERROR`/`MISSING` node. Always available,
+    /// including in [`ParseMode::HeaderOnly`] where `parse_errors` is not
+    /// collected (it is exactly `parse_errors.is_empty()` elsewhere).
+    pub parse_ok: bool,
 }
 
 /// A recovered syntax error.
@@ -471,8 +476,28 @@ pub struct ParseError {
     pub message: String,
 }
 
+/// How much of a document a parse extracts.
+///
+/// The catalog path only needs the header facts (`extract_header`), so it
+/// parses in [`ParseMode::HeaderOnly`] and never pays for the full statement
+/// tree, the token/comment streams, or the quoted-fragment recovery that only
+/// token consumers need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseMode {
+    /// Full extraction: statement tree, comments, tokens, parse errors.
+    Full,
+    /// Text-light: full statement tree minus the prose-only statements, and
+    /// tokens without their quoted-string runs. No fragment recovery.
+    Light,
+    /// Catalog header only: the module/submodule root plus the header
+    /// statements `extract_header` reads (name, prefix, namespace,
+    /// belongs-to, imports with revision-date, includes, revision). No
+    /// comments, tokens, or parse errors, and no fragment recovery.
+    HeaderOnly,
+}
+
 pub(crate) fn parse(source: String) -> ParsedDoc {
-    parse_opt(source, false)
+    parse_with(source, ParseMode::Full)
 }
 
 /// Like [`parse`], but with `light` set the Statement tree skips the pure-text
@@ -481,6 +506,17 @@ pub(crate) fn parse(source: String) -> ParsedDoc {
 /// lighter to retain while every schema/LSP feature behaves identically;
 /// default OFF (opt-in, e.g. giant-workspace catalog+closure serving).
 pub(crate) fn parse_opt(source: String, light: bool) -> ParsedDoc {
+    parse_with(
+        source,
+        if light {
+            ParseMode::Light
+        } else {
+            ParseMode::Full
+        },
+    )
+}
+
+pub(crate) fn parse_with(source: String, mode: ParseMode) -> ParsedDoc {
     let text = Text::new(Arc::from(source.as_str()));
     let mut parser = new_parser();
     // The raw CST is only needed while the views below are extracted; the
@@ -490,8 +526,29 @@ pub(crate) fn parse_opt(source: String, light: bool) -> ParsedDoc {
     let tree = parser
         .parse(&source, None)
         .expect("tree-sitter parse yields a tree");
+
+    if mode == ParseMode::HeaderOnly {
+        // Catalog scan: only the root + header statements survive; no
+        // comments, tokens or errors are collected. `has_error` is an O(1)
+        // subtree flag and equals "an ERROR/MISSING node exists".
+        let root_node = tree.root_node();
+        let parse_ok = !root_node.has_error();
+        let root = find_top_module(root_node).map(|n| build_header_statement(n, &text));
+        drop(tree);
+        return ParsedDoc {
+            text,
+            root,
+            comments: Vec::new(),
+            tokens: Vec::new(),
+            parse_errors: Vec::new(),
+            parse_ok,
+        };
+    }
+
     let parse_errors = collect_errors(tree.root_node(), &text);
+    let parse_ok = parse_errors.is_empty();
     let comments = collect_comments(tree.root_node(), &text);
+    let light = mode == ParseMode::Light;
     let excluded = if light {
         text_statement_ranges(tree.root_node())
     } else {
@@ -515,6 +572,7 @@ pub(crate) fn parse_opt(source: String, light: bool) -> ParsedDoc {
         comments,
         tokens,
         parse_errors,
+        parse_ok,
     }
 }
 
@@ -563,13 +621,25 @@ fn text_statement_ranges(node: Node) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-fn build_statement(node: Node, text: &Text, light: bool) -> Statement {
+/// Direct CST children of `node`, in order.
+fn children_of(node: Node) -> Vec<Node> {
+    (0..node.child_count())
+        .filter_map(|i| node.child(i as u32))
+        .collect()
+}
+
+/// The statement fields that do not depend on how children were selected
+/// (kind, keyword span, argument, terminator) plus the already-built child
+/// statements.
+fn statement_parts(
+    node: Node,
+    children: &[Node],
+    text: &Text,
+    child_stmts: Vec<Statement>,
+) -> Statement {
     let node_type = node.kind().to_string();
     let kind = StatementKind::from_node_type(&node_type)
         .unwrap_or(StatementKind::Unknown(node_type.clone()));
-    let children: Vec<Node> = (0..node.child_count())
-        .filter_map(|i| node.child(i as u32))
-        .collect();
 
     let keyword = {
         let kw = format!("{}_keyword", node_type.trim_end_matches("_stmt"));
@@ -597,15 +667,8 @@ fn build_statement(node: Node, text: &Text, light: bool) -> Statement {
             })
     };
 
-    let arg = find_arg(node, &children, text);
-    let end = statement_end(&children);
-
-    let child_stmts: Vec<Statement> = children
-        .into_iter()
-        .filter(|c| c.kind().ends_with("_stmt"))
-        .filter(|c| !(light && is_text_statement_kind(c.kind())))
-        .map(|c| build_statement(c, text, light))
-        .collect();
+    let arg = find_arg(node, children, text);
+    let end = statement_end(children);
 
     Statement {
         kind,
@@ -615,6 +678,61 @@ fn build_statement(node: Node, text: &Text, light: bool) -> Statement {
         end,
         children: child_stmts,
     }
+}
+
+fn build_statement(node: Node, text: &Text, light: bool) -> Statement {
+    let children = children_of(node);
+    let child_stmts: Vec<Statement> = children
+        .iter()
+        .filter(|c| c.kind().ends_with("_stmt"))
+        .filter(|c| !(light && is_text_statement_kind(c.kind())))
+        .map(|c| build_statement(*c, text, light))
+        .collect();
+    statement_parts(node, &children, text, child_stmts)
+}
+
+/// CST statement kinds that live in a module/submodule header and are read by
+/// `yang::extract_header`.
+fn is_header_statement_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "namespace_stmt"
+            | "prefix_stmt"
+            | "belongs_to_stmt"
+            | "import_stmt"
+            | "include_stmt"
+            | "revision_stmt"
+    )
+}
+
+/// Header sub-statements: the `prefix`/`revision-date` bodies an `import`,
+/// `include` or `belongs-to` may carry.
+fn is_header_substatement_kind(kind: &str) -> bool {
+    matches!(kind, "prefix_stmt" | "revision_date_stmt")
+}
+
+/// Header-only build of the root statement: keep the module/submodule root
+/// and, of its children, only the header statements (`extract_header` reads
+/// name, prefix, namespace, belongs-to, imports, includes, revision), and of
+/// those only their `prefix`/`revision-date` sub-statements. The produced
+/// `Statement` shape is identical to [`build_statement`]'s, so header
+/// extraction sees exactly the same fields without building the whole tree.
+fn build_header_statement(node: Node, text: &Text) -> Statement {
+    let children = children_of(node);
+    let child_stmts: Vec<Statement> = children
+        .iter()
+        .filter(|c| c.kind().ends_with("_stmt") && is_header_statement_kind(c.kind()))
+        .map(|c| {
+            let sub = children_of(*c);
+            let sub_stmts: Vec<Statement> = sub
+                .iter()
+                .filter(|s| s.kind().ends_with("_stmt") && is_header_substatement_kind(s.kind()))
+                .map(|s| statement_parts(*s, &children_of(*s), text, Vec::new()))
+                .collect();
+            statement_parts(*c, &sub, text, sub_stmts)
+        })
+        .collect();
+    statement_parts(node, &children, text, child_stmts)
 }
 
 /// Recover how a statement terminates from its direct CST children.
@@ -873,14 +991,22 @@ fn collect_tokens_inner(node: Node, text: &Text, out: &mut Vec<Token>) {
 /// Merge a recovered quoted-run / `+`-operator token unless an identical range
 /// is already present (the leaf walk usually produced the trailing fragments
 /// of a concatenated argument; only the missing pieces are added).
-fn push_fragment(tokens: &mut Vec<Token>, kind: TokenKind, start: usize, end: usize, text: &Text) {
+///
+/// `seen` is the O(1) membership set of every token range already collected,
+/// built once by [`augment_quoted_fragments`], so recovery stays O(tokens +
+/// fragments) instead of re-scanning the token vector per fragment.
+fn push_fragment(
+    tokens: &mut Vec<Token>,
+    seen: &mut HashSet<(usize, usize)>,
+    kind: TokenKind,
+    start: usize,
+    end: usize,
+    text: &Text,
+) {
     if start >= end {
         return;
     }
-    if tokens
-        .iter()
-        .any(|t| t.range.start == start && t.range.end == end)
-    {
+    if !seen.insert((start, end)) {
         return;
     }
     let raw = text.slice(start..end).to_string();
@@ -900,10 +1026,20 @@ fn push_fragment(tokens: &mut Vec<Token>, kind: TokenKind, start: usize, end: us
 /// Quoting follows RFC 7950 §6.1.3: single-quoted runs end at the next `'`;
 /// double-quoted runs honor backslash escapes; a `+` outside quotes is the
 /// concatenation operator.
+///
+/// Only called for parses that actually consume the token stream
+/// ([`ParseMode::Full`]): the catalog/header-only and text-light paths skip it
+/// entirely, and the membership check is an O(1) `HashSet` lookup.
 fn augment_quoted_fragments(root: &Option<Statement>, text: &Text, tokens: &mut Vec<Token>) {
     let Some(root) = root else {
         return;
     };
+    // Ranges the CST-leaf walk already produced, so only missing pieces are
+    // added (one O(n) build instead of a linear scan per fragment).
+    let mut seen: HashSet<(usize, usize)> = tokens
+        .iter()
+        .map(|t| (t.range.start, t.range.end))
+        .collect();
     for stmt in root.preorder() {
         let Some(arg) = &stmt.arg else {
             continue;
@@ -936,6 +1072,7 @@ fn augment_quoted_fragments(root: &Option<Statement>, text: &Text, tokens: &mut 
                 let end = closed.unwrap_or(raw.len());
                 push_fragment(
                     tokens,
+                    &mut seen,
                     TokenKind::String,
                     start,
                     arg.range.start + end,
@@ -948,6 +1085,7 @@ fn augment_quoted_fragments(root: &Option<Statement>, text: &Text, tokens: &mut 
                 i += c.len_utf8();
                 push_fragment(
                     tokens,
+                    &mut seen,
                     TokenKind::Operator,
                     start,
                     arg.range.start + i,
