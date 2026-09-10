@@ -153,7 +153,7 @@ by default to keep the dependency tree lean):
 
 ```toml
 [dependencies]
-yrepo = { version = "0.5", features = ["parallel"] }
+yrepo = { version = "0.6", features = ["parallel"] }
 ```
 
 With the feature enabled, `Repository::upsert_many_files` reads **and** parses

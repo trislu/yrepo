@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
+### Added
+
+- **`yrepo::PathIndex`** — a parse-free path index built from a directory
+  walk: files are grouped by basename with the `@revision-date` suffix
+  stripped (`candidates`), plus a bounded, sorted fallback over names whose
+  declared module name differs from the filename (`prefix_candidates`). This
+  is what lets startup defer all header parsing to the names actually needed.
+- **`CatalogIndex::resolve_lazy`** — grow the catalog on demand by scanning
+  **only** the candidate paths for a name that is not yet resolvable; returns
+  the winning url and how many files were parsed. Resolution follows
+  `CatalogIndex::resolve` exactly, so a lazily grown index and a whole-tree
+  index pick the same entry.
+
+### Changed
+
+- **`Catalog::scan` parses header-only** (`ParseMode::HeaderOnly`): it builds
+  only the module/submodule root plus the statements header extraction reads —
+  no full statement tree, token/comment streams or parse errors — so scan cost
+  stays close to the raw tree-sitter parse. Retained catalog fields and
+  `CatalogIndex::resolve` results are unchanged. On a 165 521-file corpus the
+  worst single file (a 5.96 MB vendor module) drops from 4.97 s to 0.19 s.
+- **Quoted-fragment recovery is linear**: the full parse's
+  concatenated-argument recovery now checks a hash set of token ranges built
+  once, so it is O(tokens + fragments) instead of re-scanning the token vector
+  per fragment.
+
+No public API break: the new items are additive and parse output for valid
+modules is unchanged.
+
 ## [0.5.0] - 2026-09-09
 
 ### Added
