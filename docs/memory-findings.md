@@ -175,7 +175,7 @@ release, `parallel`):
 | par | 12.7 s | 914 MB | 198.4 / 3.5 s |
 | par-canon (LS-style urls) | 13.0 s | 919 MB | 197.9 / 7.0 s |
 
-Worst single file (5.96 MB Cisco NX module): `Catalog::scan` 4.97 s before →
+Worst single file (a 5.96 MB vendor module; test data: https://github.com/YangModels/yang): `Catalog::scan` 4.97 s before →
 **0.19 s** after with the same harness; the scan is now parse-bound (raw
 grammar parse ≈0.14–0.16 s). The language server end-to-end (gnu + mimalloc,
 fixed yrepo) scans the same tree in **13.0 s at 3.6 % sys** (previously
