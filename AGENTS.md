@@ -94,6 +94,12 @@ by per-document tree-sitter CST retention — the current biggest lever.
 - Versioning: public-API changes → bump version + CHANGELOG. A change is only
   "breaking" if it affects something that actually shipped in a published
   version (never-released APIs can be dropped freely).
+- **Publishing is CI-owned; the agent never runs `cargo publish`.** Cut a
+  release by bumping the version + CHANGELOG and committing, then pushing a
+  `v*` tag: `.github/workflows/cargo-publish.yml` publishes to crates.io and
+  `github-release.yml` creates the GitHub release. The agent may create the
+  local tag; the human pushes it. `cargo publish --dry-run` is for validation
+  only.
 - Parser behavior changes belong in `tree-sitter-yang`: fix `grammar.js` there
   and regenerate (use the `parser-regen` skill; never hand-edit `parser.c`),
   then patch `yrepo` to the fixed grammar and bump the dependency.
