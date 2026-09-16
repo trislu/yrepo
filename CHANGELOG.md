@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-17
+
+### Changed
+
+- Maintenance re-release of the 0.7.2 feature set, cut through the release CI
+  (`.github/workflows/cargo-publish.yml` on a `v*` tag). No library change.
+
 ## [0.7.2] - 2026-09-17
 
 ### Added
