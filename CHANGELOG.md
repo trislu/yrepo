@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can resolve the value's module itself and then ask only about identity
   existence and base derivation. `check_identityref` keeps its QName behaviour
   and now delegates to it.
+- `ModuleSummary` now carries the module's own `prefix` and its top-level
+  `identity` declarations (`identities: Vec<IdentitySummary>`, each with its
+  `base` resolved to `(module, local)` in the declaring file's prefix scope).
+  `SummaryIndex` folds a submodule's identities into the parent module like the
+  other top-level names, so the summary index can answer "which workspace
+  identities derive from this base" without compiling the tree. Still
+  parse-level and additive.
 
 ### Fixed
 

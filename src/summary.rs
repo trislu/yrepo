@@ -19,6 +19,18 @@ use std::sync::Arc;
 
 use crate::syntax::{self, ParseMode};
 
+/// A parse-level `identity` declaration: its name and, when resolvable in the
+/// declaring file's prefix scope, its `base` as `(module, local)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentitySummary {
+    /// Identity name (`identity <name>`).
+    pub name: String,
+    /// The `base` identity, resolved to `(module, local)` via the declaring
+    /// file's prefix map. `None` when there is no `base` or its prefix does not
+    /// resolve.
+    pub base: Option<(String, String)>,
+}
+
 /// A parse-level summary of one module/submodule document: its header facts
 /// plus the names of its direct top-level data nodes, `rpc`s and
 /// `notification`s. No compiled schema, no full statement tree.
@@ -33,6 +45,9 @@ pub struct ModuleSummary {
     /// Latest `revision` date, if present (ISO strings compare
     /// lexicographically).
     pub revision: Option<String>,
+    /// The module's own `prefix` (for a submodule, the `belongs-to` prefix).
+    /// An identityref value's XML prefix may reuse it.
+    pub prefix: Option<String>,
     /// Top-level data node names (`container`/`leaf`/`leaf-list`/`list`/
     /// `anyxml`/`anydata`), in source order.
     pub top_data: Vec<String>,
@@ -40,6 +55,9 @@ pub struct ModuleSummary {
     pub rpcs: Vec<String>,
     /// Top-level `notification` names, in source order.
     pub notifications: Vec<String>,
+    /// Top-level `identity` declarations, in source order, with `base` resolved
+    /// to `(module, local)`.
+    pub identities: Vec<IdentitySummary>,
 }
 
 impl ModuleSummary {
@@ -64,18 +82,59 @@ fn scan_parts(url: Arc<str>, source: String) -> (ModuleSummary, ScanMeta) {
         // whose summary absorbs this submodule's top-level names.
         belongs_to: header.belongs_to.as_ref().map(|(parent, _)| parent.clone()),
     };
+    // Resolve each identity's `base` in the declaring file's prefix scope while
+    // the header's import map is still available.
+    let identities = scan
+        .identities
+        .into_iter()
+        .map(|(name, base)| IdentitySummary {
+            name,
+            base: base.as_deref().and_then(|b| resolve_base(&header, b)),
+        })
+        .collect();
     (
         ModuleSummary {
             url,
             name: header.name.unwrap_or_default(),
             namespace: header.namespace,
             revision: header.revision,
+            prefix: header.own_prefix,
             top_data: scan.top_data,
             rpcs: scan.rpcs,
             notifications: scan.notifications,
+            identities,
         },
         meta,
     )
+}
+
+/// Resolve an identity `base` argument to `(module, local)` in the declaring
+/// file's prefix scope: bare (or the file's own prefix) is the file's module
+/// (a submodule's `belongs-to` parent), otherwise the matching `import` module.
+/// `None` when the prefix does not resolve.
+fn resolve_base(header: &crate::yang::Header, raw: &str) -> Option<(String, String)> {
+    let own_module = header
+        .belongs_to
+        .as_ref()
+        .map(|(parent, _)| parent.clone())
+        .or_else(|| header.name.clone())?;
+    let (prefix, local) = match raw.split_once(':') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, raw),
+    };
+    match prefix {
+        None => Some((own_module, local.to_owned())),
+        Some(p) => {
+            if header.own_prefix.as_deref() == Some(p) {
+                return Some((own_module, local.to_owned()));
+            }
+            header
+                .imports
+                .iter()
+                .find(|i| i.prefix == p)
+                .map(|i| (i.module.clone(), local.to_owned()))
+        }
+    }
 }
 
 /// Private per-document scan metadata: the parse status used for tie-breaking
@@ -103,6 +162,7 @@ struct FoldedNames {
     top_data: Vec<String>,
     rpcs: Vec<String>,
     notifications: Vec<String>,
+    identities: Vec<IdentitySummary>,
 }
 
 /// An in-memory index of [`ModuleSummary`] documents, indexed by namespace for
@@ -181,6 +241,7 @@ impl SummaryIndex {
             slot.rpcs.extend(e.summary.rpcs.iter().cloned());
             slot.notifications
                 .extend(e.summary.notifications.iter().cloned());
+            slot.identities.extend(e.summary.identities.iter().cloned());
         }
         if by_parent.is_empty() {
             return;
@@ -195,6 +256,11 @@ impl SummaryIndex {
             extend_unique(&mut e.summary.top_data, &folded.top_data);
             extend_unique(&mut e.summary.rpcs, &folded.rpcs);
             extend_unique(&mut e.summary.notifications, &folded.notifications);
+            for id in &folded.identities {
+                if !e.summary.identities.iter().any(|x| x.name == id.name) {
+                    e.summary.identities.push(id.clone());
+                }
+            }
         }
     }
 
@@ -415,6 +481,125 @@ submodule demo-sub {
             .expect("submodule summary kept");
         assert_eq!(sub.namespace, None);
         assert_eq!(sub.top_data, vec!["a"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Identities and their `base` are summarized, the base prefix resolved in
+    /// the declaring file's import scope; submodule identities fold into the
+    /// parent module like its top-level names.
+    #[test]
+    fn identity_declarations_and_bases_are_summarized_and_folded() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "yrepo-summary-ident-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, src: &str| {
+            let p = dir.join(name);
+            fs::write(&p, src).unwrap();
+            p
+        };
+        let ida = write(
+            "ida.yang",
+            r#"module ida {
+  yang-version 1.1;
+  namespace "urn:ida";
+  prefix a;
+  import idb { prefix b; }
+  revision 2026-01-01;
+  identity root;
+  identity child { base root; }
+  identity ext { base b:other; }
+}"#,
+        );
+        let idb = write(
+            "idb.yang",
+            r#"module idb {
+  yang-version 1.1;
+  namespace "urn:idb";
+  prefix b;
+  import ida { prefix a; }
+  revision 2026-01-01;
+  identity other;
+  identity deeper { base a:root; }
+}"#,
+        );
+        let idc = write(
+            "idc.yang",
+            r#"module idc {
+  yang-version 1.1;
+  namespace "urn:idc";
+  prefix c;
+  revision 2026-01-01;
+  identity croot;
+}"#,
+        );
+        let sub = write(
+            "idc-sub.yang",
+            r#"submodule idc-sub {
+  yang-version 1.1;
+  belongs-to idc { prefix c; }
+  revision 2026-01-01;
+  identity subid { base croot; }
+}"#,
+        );
+
+        let mut index = SummaryIndex::default();
+        index.scan_many_files_with([&ida, &idb, &idc, &sub], |p| {
+            Some(format!("file://{}", p.display()))
+        });
+
+        let a = index.resolve_namespace("urn:ida").expect("ida");
+        assert_eq!(a.prefix.as_deref(), Some("a"));
+        assert_eq!(
+            a.identities,
+            vec![
+                IdentitySummary {
+                    name: "root".into(),
+                    base: None,
+                },
+                IdentitySummary {
+                    name: "child".into(),
+                    base: Some(("ida".into(), "root".into())),
+                },
+                IdentitySummary {
+                    name: "ext".into(),
+                    base: Some(("idb".into(), "other".into())),
+                },
+            ]
+        );
+        let b = index.resolve_namespace("urn:idb").expect("idb");
+        assert_eq!(
+            b.identities
+                .iter()
+                .find(|i| i.name == "deeper")
+                .unwrap()
+                .base,
+            Some(("ida".into(), "root".into()))
+        );
+        // The submodule's identity is attributed to the parent module and its
+        // bare base resolves against the belongs-to module.
+        let c = index.resolve_namespace("urn:idc").expect("idc");
+        assert_eq!(
+            c.identities
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["croot", "subid"]
+        );
+        assert_eq!(
+            c.identities
+                .iter()
+                .find(|i| i.name == "subid")
+                .unwrap()
+                .base,
+            Some(("idc".into(), "croot".into()))
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

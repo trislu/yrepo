@@ -484,6 +484,10 @@ pub(crate) struct SummaryScan {
     pub(crate) rpcs: Vec<String>,
     /// Top-level `notification` names, in source order.
     pub(crate) notifications: Vec<String>,
+    /// Top-level `identity` declarations as `(name, base argument)`, in source
+    /// order. The base is still the raw argument (a prefix/bare name); the
+    /// summary resolves it against the declaring file's prefix scope.
+    pub(crate) identities: Vec<(String, Option<String>)>,
 }
 
 /// A recovered syntax error.
@@ -779,21 +783,39 @@ fn scan_summary_names(root: Node, text: &Text) -> SummaryScan {
         if !kind.ends_with("_stmt") {
             continue;
         }
-        let bucket = match kind {
+        match kind {
             "container_stmt" | "leaf_stmt" | "leaf_list_stmt" | "list_stmt" | "anyxml_stmt"
-            | "anydata_stmt" => &mut out.top_data,
-            "rpc_stmt" => &mut out.rpcs,
-            "notification_stmt" => &mut out.notifications,
-            _ => continue,
-        };
-        if let Some(name) = find_arg(child, &children_of(child), text)
-            .map(|a| a.name().to_string())
-            .filter(|n| !n.is_empty())
-        {
-            bucket.push(name);
+            | "anydata_stmt" => push_arg(&mut out.top_data, child, text),
+            "rpc_stmt" => push_arg(&mut out.rpcs, child, text),
+            "notification_stmt" => push_arg(&mut out.notifications, child, text),
+            "identity_stmt" => {
+                let Some(name) = arg_of(child, text) else {
+                    continue;
+                };
+                let base = children_of(child)
+                    .into_iter()
+                    .find(|c| c.kind() == "base_stmt")
+                    .and_then(|b| arg_of(b, text));
+                out.identities.push((name, base));
+            }
+            _ => {}
         }
     }
     out
+}
+
+/// The non-empty argument of a statement node, if any.
+fn arg_of(node: Node, text: &Text) -> Option<String> {
+    find_arg(node, &children_of(node), text)
+        .map(|a| a.name().to_string())
+        .filter(|n| !n.is_empty())
+}
+
+/// Push a statement's argument onto `bucket`, if it has a non-empty one.
+fn push_arg(bucket: &mut Vec<String>, node: Node, text: &Text) {
+    if let Some(name) = arg_of(node, text) {
+        bucket.push(name);
+    }
 }
 
 /// Recover how a statement terminates from its direct CST children.
