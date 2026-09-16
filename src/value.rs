@@ -470,4 +470,35 @@ mod tests {
             crate::IdentityStatus::Ok
         );
     }
+
+    /// `check_identityref_in` skips prefix/module-name guessing: the caller
+    /// supplies the value's module (an XML namespace resolved to a module, or
+    /// an RFC 7951 `module:name`). Same derivation semantics as
+    /// `check_identityref`, but an uncompiled value module is
+    /// `UnknownIdentity` regardless of any same-named prefix.
+    #[test]
+    fn check_identityref_in_uses_the_callers_module() {
+        let l = lib(IDENT);
+        assert_eq!(
+            l.check_identityref_in("m", Some("base"), "m", "child"),
+            crate::IdentityStatus::Ok
+        );
+        assert_eq!(
+            l.check_identityref_in("m", Some("base"), "m", "other"),
+            crate::IdentityStatus::NotDerived
+        );
+        assert_eq!(
+            l.check_identityref_in("m", Some("base"), "m", "nope"),
+            crate::IdentityStatus::UnknownIdentity
+        );
+        assert_eq!(
+            l.check_identityref_in("m", None, "m", "other"),
+            crate::IdentityStatus::Ok
+        );
+        // `m` has no `ghost` import prefix, so a missing module stays unknown.
+        assert_eq!(
+            l.check_identityref_in("m", Some("base"), "ghost", "child"),
+            crate::IdentityStatus::UnknownIdentity
+        );
+    }
 }

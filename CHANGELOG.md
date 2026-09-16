@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Library::check_identityref_in(leaf_module, base, value_module, value_local)`
+  — the semantic `identityref` check for a value whose **module the caller has
+  already resolved** (an XML namespace prefix/default namespace per RFC 7950
+  §9.10.3, or an RFC 7951 `module:name`). It removes the prefix/module-name
+  guessing `check_identityref` needs for a raw QName, so an instance encoding
+  can resolve the value's module itself and then ask only about identity
+  existence and base derivation. `check_identityref` keeps its QName behaviour
+  and now delegates to it.
+
 ### Fixed
 
 - **Submodule top-level names are folded into their parent module's summary.**

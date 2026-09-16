@@ -595,20 +595,42 @@ impl Library {
         let Some((vm, vl)) = self.qresolve(module, value) else {
             return IdentityStatus::UnknownIdentity;
         };
-        let Some(rec) = self.module(&vm) else {
+        self.check_identityref_in(module, base, &vm, &vl)
+    }
+
+    /// Semantic check for an `identityref` value whose **module the caller has
+    /// already resolved**, so no YANG-prefix/name guessing is involved.
+    /// Instance encodings resolve the module themselves: XML from the value's
+    /// XML namespace prefix or in-scope default namespace (RFC 7950 §9.10.3),
+    /// JSON from its `module:name` qualifier (RFC 7951 §6.8).
+    ///
+    /// `leaf_module` is the module the leaf is defined in and `base` its
+    /// identityref `base`, resolved in `leaf_module`'s YANG scope. The identity
+    /// `(value_module, value_local)` must exist and be `base` or derived from
+    /// it; with no `base`, any existing identity is accepted. A `value_module`
+    /// that is not compiled is [`IdentityStatus::UnknownIdentity`] — never an
+    /// accidental match against a same-named prefix.
+    pub fn check_identityref_in(
+        &self,
+        leaf_module: &str,
+        base: Option<&str>,
+        value_module: &str,
+        value_local: &str,
+    ) -> IdentityStatus {
+        let Some(rec) = self.module(value_module) else {
             return IdentityStatus::UnknownIdentity;
         };
-        let Some(id) = rec.identities.iter().find(|i| i.name == vl) else {
+        let Some(id) = rec.identities.iter().find(|i| i.name == value_local) else {
             return IdentityStatus::UnknownIdentity;
         };
         let Some(base) = base else {
             return IdentityStatus::Ok;
         };
         // An unresolvable base is a schema problem; stay silent on values.
-        let Some((bm, bl)) = self.qresolve(module, base) else {
+        let Some((bm, bl)) = self.qresolve(leaf_module, base) else {
             return IdentityStatus::Ok;
         };
-        if self.identity_reaches(&vm, id, &bm, &bl) {
+        if self.identity_reaches(value_module, id, &bm, &bl) {
             IdentityStatus::Ok
         } else {
             IdentityStatus::NotDerived
