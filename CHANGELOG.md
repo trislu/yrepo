@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Submodule top-level names are folded into their parent module's summary.**
+  A submodule has no namespace, so a namespace-keyed projection of
+  `SummaryIndex` (the language server's Tier-1 schema suggestions) dropped the
+  top-level data nodes, `rpc`s and `notification`s it declares, even though at
+  run time they live in the parent module's namespace.
+  `SummaryIndex::scan_many_files_with` now merges every submodule's names into
+  the summary of the module named by its `belongs-to` (deduplicated, source
+  order preserved). The fold is revision-agnostic: a name declared by any
+  submodule of a module is added to every indexed revision of it, so it can only
+  over-approximate a suggestion list, never invent an unrelated name. No public
+  API change.
+
 ## [0.7.1] - 2026-09-11
 
 ### Added

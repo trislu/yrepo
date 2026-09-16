@@ -6,8 +6,14 @@
 //! This is the cheap "what does this file declare?" scan for tree-wide
 //! navigation (namespace → module lookup, outline/index building), the sibling
 //! of the header-only [`crate::Catalog`] scan. See `syntax::ParseMode::Summary`.
+//!
+//! A submodule is summarized like a module (its header comes from
+//! `belongs-to`), and [`SummaryIndex::scan_many_files_with`] then **folds** a
+//! submodule's top-level names into the summary of the module it belongs to:
+//! the submodule has no namespace of its own, so a namespace-keyed projection
+//! would otherwise lose the nodes it declares.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,13 +52,18 @@ impl ModuleSummary {
     }
 }
 
-/// One summary parse: the retained [`ModuleSummary`] plus the parse status used
-/// for index tie-breaking.
-fn scan_parts(url: Arc<str>, source: String) -> (ModuleSummary, bool) {
+/// One summary parse: the retained [`ModuleSummary`] plus the private scan
+/// metadata used to fold a submodule's names into its parent module.
+fn scan_parts(url: Arc<str>, source: String) -> (ModuleSummary, ScanMeta) {
     let parsed = syntax::parse_with(source, ParseMode::Summary);
-    let parse_ok = parsed.parse_ok;
     let header = crate::yang::extract_header(parsed.root.as_ref());
     let scan = parsed.summary.unwrap_or_default();
+    let meta = ScanMeta {
+        parse_ok: parsed.parse_ok,
+        // `belongs-to` is present only on a submodule; it names the module
+        // whose summary absorbs this submodule's top-level names.
+        belongs_to: header.belongs_to.as_ref().map(|(parent, _)| parent.clone()),
+    };
     (
         ModuleSummary {
             url,
@@ -63,16 +74,35 @@ fn scan_parts(url: Arc<str>, source: String) -> (ModuleSummary, bool) {
             rpcs: scan.rpcs,
             notifications: scan.notifications,
         },
-        parse_ok,
+        meta,
     )
+}
+
+/// Private per-document scan metadata: the parse status used for tie-breaking
+/// and the `belongs-to` parent that makes a submodule's names fold into its
+/// module's summary.
+#[derive(Debug, Clone, Default)]
+struct ScanMeta {
+    /// True when the summary parse saw no `ERROR`/`MISSING` node.
+    parse_ok: bool,
+    /// `Some(parent)` for a submodule (`belongs-to`), `None` for a module.
+    belongs_to: Option<String>,
 }
 
 /// One indexed summary plus the parse status used only for tie-breaking.
 #[derive(Debug, Clone)]
 struct Entry {
     summary: ModuleSummary,
-    /// True when the summary parse saw no `ERROR`/`MISSING` node.
-    parse_ok: bool,
+    meta: ScanMeta,
+}
+
+/// The top-level names every submodule of one parent module contributes,
+/// gathered before they are folded into the parent's [`ModuleSummary`].
+#[derive(Debug, Default)]
+struct FoldedNames {
+    top_data: Vec<String>,
+    rpcs: Vec<String>,
+    notifications: Vec<String>,
 }
 
 /// An in-memory index of [`ModuleSummary`] documents, indexed by namespace for
@@ -101,27 +131,71 @@ impl SummaryIndex {
             .into_iter()
             .map(|p| p.as_ref().to_path_buf())
             .collect();
-        let scanned: Vec<Option<(ModuleSummary, bool)>> = crate::compile::map_par(&paths, |p| {
-            let url = url_for(p)?;
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|text| scan_parts(url.into(), text))
-        });
+        let scanned: Vec<Option<(ModuleSummary, ScanMeta)>> =
+            crate::compile::map_par(&paths, |p| {
+                let url = url_for(p)?;
+                std::fs::read_to_string(p)
+                    .ok()
+                    .map(|text| scan_parts(url.into(), text))
+            });
         let mut n = 0usize;
-        for (summary, parse_ok) in scanned.into_iter().flatten() {
-            self.push_with(summary, parse_ok);
+        for (summary, meta) in scanned.into_iter().flatten() {
+            self.push_with(summary, meta);
             n += 1;
         }
+        self.fold_submodules();
         n
     }
 
     /// Insert one summarized document (callers feed entries in any order).
-    fn push_with(&mut self, summary: ModuleSummary, parse_ok: bool) {
+    fn push_with(&mut self, summary: ModuleSummary, meta: ScanMeta) {
         let i = self.entries.len();
         if let Some(ns) = summary.namespace.clone().filter(|s| !s.is_empty()) {
             self.by_namespace.entry(ns).or_default().push(i);
         }
-        self.entries.push(Entry { summary, parse_ok });
+        self.entries.push(Entry { summary, meta });
+    }
+
+    /// Fold every submodule's top-level names into the summary of the module it
+    /// `belongs-to`.
+    ///
+    /// A submodule has no namespace of its own, so a namespace-keyed projection
+    /// (e.g. the language server's Tier-1 `ModuleInfo`) would drop the data
+    /// nodes, `rpc`s and `notification`s it declares — even though at run time
+    /// they live in the parent module's namespace. The fold is
+    /// revision-agnostic: a name declared by any submodule of a module is added
+    /// to every indexed revision of that module. That can only over-approximate
+    /// a completion/suggestion list across revisions, never invent an
+    /// unrelated module's name. The submodule entries themselves are kept
+    /// unchanged (still namespace-less, so still not namespace-resolvable).
+    fn fold_submodules(&mut self) {
+        // Gather first (owned) so the mutable pass below does not borrow
+        // `self.entries` immutably.
+        let mut by_parent: HashMap<String, FoldedNames> = HashMap::new();
+        for e in &self.entries {
+            let Some(parent) = e.meta.belongs_to.as_ref() else {
+                continue;
+            };
+            let slot = by_parent.entry(parent.clone()).or_default();
+            slot.top_data.extend(e.summary.top_data.iter().cloned());
+            slot.rpcs.extend(e.summary.rpcs.iter().cloned());
+            slot.notifications
+                .extend(e.summary.notifications.iter().cloned());
+        }
+        if by_parent.is_empty() {
+            return;
+        }
+        for e in &mut self.entries {
+            if e.meta.belongs_to.is_some() {
+                continue; // only a module's summary absorbs submodules
+            }
+            let Some(folded) = by_parent.get(&e.summary.name) else {
+                continue;
+            };
+            extend_unique(&mut e.summary.top_data, &folded.top_data);
+            extend_unique(&mut e.summary.rpcs, &folded.rpcs);
+            extend_unique(&mut e.summary.notifications, &folded.notifications);
+        }
     }
 
     /// The summary of the highest-revision document declaring `namespace`
@@ -136,7 +210,8 @@ impl SummaryIndex {
                 let b = &self.entries[b];
                 let ra = a.summary.revision.clone().unwrap_or_default();
                 let rb = b.summary.revision.clone().unwrap_or_default();
-                ra.cmp(&rb).then_with(|| b.parse_ok.cmp(&a.parse_ok))
+                ra.cmp(&rb)
+                    .then_with(|| b.meta.parse_ok.cmp(&a.meta.parse_ok))
             })
             .map(|i| &self.entries[i].summary)
     }
@@ -154,6 +229,18 @@ impl SummaryIndex {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Append the names of `src` that are not already in `dst`, preserving order.
+/// The result is a stable union used when folding submodule names into a parent
+/// module summary.
+fn extend_unique(dst: &mut Vec<String>, src: &[String]) {
+    let mut seen: HashSet<String> = dst.iter().cloned().collect();
+    for name in src {
+        if seen.insert(name.clone()) {
+            dst.push(name.clone());
+        }
     }
 }
 
@@ -270,6 +357,67 @@ submodule demo-sub {
         assert!(summary.notifications.is_empty());
     }
 
+    /// Submodules are namespace-less, so a namespace-keyed projection would
+    /// drop the top-level nodes they declare. `scan_many_files_with` folds them
+    /// into the summary of the module they `belongs-to` (deduplicated, source
+    /// order preserved), for data nodes, `rpc`s and `notification`s alike.
+    #[test]
+    fn submodule_top_level_names_fold_into_parent() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "yrepo-summary-fold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, src: &str| {
+            let p = dir.join(name);
+            fs::write(&p, src).unwrap();
+            p
+        };
+        let parent = write(
+            "p.yang",
+            "module p { namespace \"urn:p\"; prefix p; container own { leaf x { type string; } } rpc pr; }",
+        );
+        let sub_a = write(
+            "p-sub-a.yang",
+            "submodule p-sub-a { belongs-to p { prefix p; } container a { leaf x { type string; } } notification an; }",
+        );
+        // Declares `own` again (dedup) and adds a list plus an rpc.
+        let sub_b = write(
+            "p-sub-b.yang",
+            "submodule p-sub-b { belongs-to p { prefix p; } leaf own { type string; } list b { key k; leaf k { type string; } } rpc br; }",
+        );
+        // An orphan submodule whose parent is not in the index must not panic.
+        let orphan = write(
+            "ghost-sub.yang",
+            "submodule ghost-sub { belongs-to ghost { prefix g; } leaf gone { type string; } }",
+        );
+
+        let mut index = SummaryIndex::default();
+        index.scan_many_files_with([&parent, &sub_a, &sub_b, &orphan], |p| {
+            Some(format!("file://{}", p.display()))
+        });
+
+        let m = index.resolve_namespace("urn:p").expect("urn:p resolves");
+        assert_eq!(m.top_data, vec!["own", "a", "b"], "order + dedup");
+        assert_eq!(m.rpcs, vec!["pr", "br"]);
+        assert_eq!(m.notifications, vec!["an"]);
+        // The submodule summaries are still present and namespace-less, so a
+        // namespace lookup never returns one.
+        assert!(index.resolve_namespace("").is_none());
+        let sub = index
+            .summaries()
+            .find(|s| s.name == "p-sub-a")
+            .expect("submodule summary kept");
+        assert_eq!(sub.namespace, None);
+        assert_eq!(sub.top_data, vec!["a"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn scan_many_files_with_resolves_namespace_preferring_latest_clean() {
         use std::fs;
@@ -337,7 +485,9 @@ submodule demo-sub {
             winner.url
         );
         assert_eq!(winner.revision.as_deref(), Some("2021-01-01"));
-        assert_eq!(winner.top_data, vec!["a"]);
+        // The submodule that belongs to `dup` has folded its `leaf s` into the
+        // parent summary (see `submodule_top_level_names_fold_into_parent`).
+        assert_eq!(winner.top_data, vec!["a", "s"]);
 
         assert!(index.resolve_namespace("urn:other").is_some());
         // A submodule has no namespace and is never namespace-resolvable.
